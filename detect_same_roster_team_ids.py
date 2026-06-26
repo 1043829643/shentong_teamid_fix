@@ -15,6 +15,7 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from itertools import combinations
 from typing import Any, Iterable
 
 
@@ -181,11 +182,12 @@ def discover_candidates(connection: Any, only_database: str | None) -> list[Fiel
                 )
             )
 
-    if only_database in (None, "dota2_analysis"):
+    if only_database in (None, "dota2_stats", "dota2_analysis"):
+        database = only_database or "dota2_stats"
         candidates.insert(
             0,
             FieldMapping(
-                database="dota2_analysis",
+                database=database,
                 table="players__match_info",
                 league_col="match_info.league_id",
                 team_col="match_info.radiant_team_id/dire_team_id",
@@ -257,7 +259,7 @@ def resolve_mapping(args: argparse.Namespace, connection: Any) -> FieldMapping:
 
 
 def build_detection_sql(mapping: FieldMapping, args: argparse.Namespace) -> tuple[str, list[Any]]:
-    if mapping.database == "dota2_analysis" and mapping.table == "players__match_info":
+    if mapping.table == "players__match_info":
         return build_dota2_analysis_detection_sql(args)
 
     league_expr = f"CAST({quote_ident(mapping.league_col)} AS VARCHAR)"
@@ -323,7 +325,15 @@ def build_detection_sql(mapping: FieldMapping, args: argparse.Namespace) -> tupl
     return sql, params
 
 
-def build_dota2_analysis_detection_sql(args: argparse.Namespace) -> tuple[str, list[Any]]:
+def _analysis_filters(args: argparse.Namespace) -> tuple[str, list[str], list[str], list[Any]]:
+    """Build shared schema/filters/params for the dota2_stats detection CTEs.
+
+    Parameter order matches the order the placeholders appear in the SQL:
+    time filters (inside match_info_dedup) come before the league filter
+    (inside player_rows).
+    """
+    database = getattr(args, "database", None) or "dota2_stats"
+    schema = quote_ident(database)
     filters = ["mi.league_id IS NOT NULL"]
     match_filters = [
         "match_id IS NOT NULL",
@@ -331,9 +341,6 @@ def build_dota2_analysis_detection_sql(args: argparse.Namespace) -> tuple[str, l
         "league_id IS NOT NULL",
     ]
     params: list[Any] = []
-    if args.league_id is not None:
-        filters.append("mi.league_id = %s")
-        params.append(args.league_id)
 
     start_time = parse_time_filter(getattr(args, "start_time", None))
     end_time = parse_time_filter(getattr(args, "end_time", None), end_of_day=True)
@@ -343,10 +350,103 @@ def build_dota2_analysis_detection_sql(args: argparse.Namespace) -> tuple[str, l
     if end_time is not None:
         match_filters.append("end_time <= %s")
         params.append(end_time)
+    if args.league_id is not None:
+        filters.append("mi.league_id = %s")
+        params.append(args.league_id)
+    return schema, match_filters, filters, params
+
+
+def _build_analysis_ctes(schema: str, match_filters: list[str], filters: list[str]) -> str:
+    return f"""league_names AS (
+            SELECT CAST(league_id AS VARCHAR) AS league_id, MAX(league_name) AS league_name
+            FROM (
+                SELECT league_id, league_name FROM {schema}.`pro_match_list`
+                UNION ALL
+                SELECT league_id, league_name FROM {schema}.`pro_match_list_2`
+                UNION ALL
+                SELECT league_id, league_name FROM {schema}.`match_info_upload`
+            ) names
+            WHERE league_id IS NOT NULL
+              AND league_name IS NOT NULL
+              AND league_name <> ''
+            GROUP BY CAST(league_id AS VARCHAR)
+        ),
+        pro_players_dedup AS (
+            SELECT CAST(steamid AS VARCHAR) AS steamid, MAX(name) AS player_name
+            FROM {schema}.`pro_players`
+            WHERE steamid IS NOT NULL
+            GROUP BY CAST(steamid AS VARCHAR)
+        ),
+        match_info_dedup AS (
+            SELECT
+                CAST(match_id AS VARCHAR) AS match_id,
+                CAST(MAX(league_id) AS VARCHAR) AS league_id,
+                CAST(MAX(radiant_team_id) AS VARCHAR) AS radiant_team_id,
+                CAST(MAX(dire_team_id) AS VARCHAR) AS dire_team_id,
+                MAX(radiant_team_tag) AS radiant_team_name,
+                MAX(dire_team_tag) AS dire_team_name,
+                MIN(end_time) AS first_seen,
+                MAX(end_time) AS last_seen
+            FROM {schema}.`match_info`
+            WHERE {" AND ".join(match_filters)}
+            GROUP BY CAST(match_id AS VARCHAR)
+        ),
+        player_rows AS (
+            SELECT
+                mi.league_id,
+                mi.match_id,
+                CASE
+                    WHEN p.team = 2 THEN mi.radiant_team_id
+                    WHEN p.team = 3 THEN mi.dire_team_id
+                    WHEN p.slot BETWEEN 0 AND 4 THEN mi.radiant_team_id
+                    WHEN p.slot BETWEEN 5 AND 9 THEN mi.dire_team_id
+                END AS team_id,
+                CASE
+                    WHEN p.team = 2 THEN mi.radiant_team_name
+                    WHEN p.team = 3 THEN mi.dire_team_name
+                    WHEN p.slot BETWEEN 0 AND 4 THEN mi.radiant_team_name
+                    WHEN p.slot BETWEEN 5 AND 9 THEN mi.dire_team_name
+                END AS team_name,
+                CAST(p.steamid AS VARCHAR) AS player_id,
+                pp.player_name,
+                mi.first_seen,
+                mi.last_seen
+            FROM {schema}.`players` p
+            JOIN match_info_dedup mi
+              ON CAST(p.match_id AS VARCHAR) = mi.match_id
+            LEFT JOIN pro_players_dedup pp
+              ON CAST(p.steamid AS VARCHAR) = pp.steamid
+            WHERE p.steamid IS NOT NULL
+              AND CAST(p.match_id AS VARCHAR) <> '0'
+              AND {" AND ".join(filters)}
+        ),
+        team_rosters AS (
+            SELECT
+                league_id,
+                match_id,
+                CAST(team_id AS VARCHAR) AS team_id,
+                MAX(team_name) AS team_name,
+                COUNT(DISTINCT player_id) AS player_count,
+                GROUP_CONCAT(DISTINCT player_id ORDER BY player_id SEPARATOR ',') AS roster_key,
+                GROUP_CONCAT(
+                    DISTINCT CONCAT(player_id, ' | ', COALESCE(player_name, ''))
+                    ORDER BY player_id
+                    SEPARATOR ';;'
+                ) AS roster_players,
+                MIN(first_seen) AS first_seen,
+                MAX(last_seen) AS last_seen
+            FROM player_rows
+            WHERE team_id IS NOT NULL
+              AND CAST(team_id AS VARCHAR) <> '0'
+            GROUP BY league_id, match_id, CAST(team_id AS VARCHAR)
+            HAVING COUNT(DISTINCT player_id) = 5
+        )"""
+
+
+def build_dota2_analysis_detection_sql(args: argparse.Namespace) -> tuple[str, list[Any]]:
+    schema, match_filters, filters, params = _analysis_filters(args)
 
     limit_clause = " LIMIT %s" if args.limit else ""
-    if args.limit:
-        params.append(args.limit)
 
     detection_mode = getattr(args, "detection_mode", "same_league")
     if detection_mode == "cross_league":
@@ -409,101 +509,205 @@ def build_dota2_analysis_detection_sql(args: argparse.Namespace) -> tuple[str, l
         )
         """
 
+    ctes = _build_analysis_ctes(schema, match_filters, filters)
     sql = f"""
-        WITH league_names AS (
-            SELECT CAST(league_id AS VARCHAR) AS league_id, MAX(league_name) AS league_name
-            FROM (
-                SELECT league_id, league_name FROM `dota2_analysis`.`pro_match_list`
-                UNION ALL
-                SELECT league_id, league_name FROM `dota2_analysis`.`pro_match_list_2`
-                UNION ALL
-                SELECT league_id, league_name FROM `dota2_analysis`.`match_info_upload`
-            ) names
-            WHERE league_id IS NOT NULL
-              AND league_name IS NOT NULL
-              AND league_name <> ''
-            GROUP BY CAST(league_id AS VARCHAR)
-        ),
-        pro_players_dedup AS (
-            SELECT CAST(steamid AS VARCHAR) AS steamid, MAX(name) AS player_name
-            FROM `dota2_analysis`.`pro_players`
-            WHERE steamid IS NOT NULL
-            GROUP BY CAST(steamid AS VARCHAR)
-        ),
-        match_info_dedup AS (
-            SELECT
-                CAST(match_id AS VARCHAR) AS match_id,
-                CAST(MAX(league_id) AS VARCHAR) AS league_id,
-                CAST(MAX(radiant_team_id) AS VARCHAR) AS radiant_team_id,
-                CAST(MAX(dire_team_id) AS VARCHAR) AS dire_team_id,
-                MAX(radiant_team_tag) AS radiant_team_name,
-                MAX(dire_team_tag) AS dire_team_name,
-                MIN(end_time) AS first_seen,
-                MAX(end_time) AS last_seen
-            FROM `dota2_analysis`.`match_info`
-            WHERE {" AND ".join(match_filters)}
-            GROUP BY CAST(match_id AS VARCHAR)
-        ),
-        player_rows AS (
-            SELECT
-                mi.league_id,
-                mi.match_id,
-                CASE
-                    WHEN p.team = 2 THEN mi.radiant_team_id
-                    WHEN p.team = 3 THEN mi.dire_team_id
-                    WHEN p.slot BETWEEN 0 AND 4 THEN mi.radiant_team_id
-                    WHEN p.slot BETWEEN 5 AND 9 THEN mi.dire_team_id
-                END AS team_id,
-                CASE
-                    WHEN p.team = 2 THEN mi.radiant_team_name
-                    WHEN p.team = 3 THEN mi.dire_team_name
-                    WHEN p.slot BETWEEN 0 AND 4 THEN mi.radiant_team_name
-                    WHEN p.slot BETWEEN 5 AND 9 THEN mi.dire_team_name
-                END AS team_name,
-                CAST(p.steamid AS VARCHAR) AS player_id,
-                pp.player_name,
-                mi.first_seen,
-                mi.last_seen
-            FROM `dota2_analysis`.`players` p
-            JOIN match_info_dedup mi
-              ON CAST(p.match_id AS VARCHAR) = mi.match_id
-            LEFT JOIN pro_players_dedup pp
-              ON CAST(p.steamid AS VARCHAR) = pp.steamid
-            WHERE p.steamid IS NOT NULL
-              AND CAST(p.match_id AS VARCHAR) <> '0'
-              AND {" AND ".join(filters)}
-        ),
-        team_rosters AS (
-            SELECT
-                league_id,
-                match_id,
-                CAST(team_id AS VARCHAR) AS team_id,
-                MAX(team_name) AS team_name,
-                COUNT(DISTINCT player_id) AS player_count,
-                GROUP_CONCAT(DISTINCT player_id ORDER BY player_id SEPARATOR ',') AS roster_key,
-                GROUP_CONCAT(
-                    DISTINCT CONCAT(player_id, ' | ', COALESCE(player_name, ''))
-                    ORDER BY player_id
-                    SEPARATOR ';;'
-                ) AS roster_players,
-                MIN(first_seen) AS first_seen,
-                MAX(last_seen) AS last_seen
-            FROM player_rows
-            WHERE team_id IS NOT NULL
-              AND CAST(team_id AS VARCHAR) <> '0'
-            GROUP BY league_id, match_id, CAST(team_id AS VARCHAR)
-            HAVING COUNT(DISTINCT player_id) = 5
-        ),
+        WITH {ctes},
         {anomaly_sql}
         SELECT *
         FROM anomalies
         ORDER BY league_id, team_id_count DESC, roster_occurrences DESC, roster_key
         {limit_clause}
     """
+    if args.limit:
+        params.append(args.limit)
     return sql, params
 
 
+def build_fuzzy_base_sql(args: argparse.Namespace) -> tuple[str, list[Any]]:
+    """Return one row per (league, match, team) 5-player roster with names.
+
+    The fuzzy clustering is then done in Python, so no LIMIT is applied here.
+    """
+    schema, match_filters, filters, params = _analysis_filters(args)
+    ctes = _build_analysis_ctes(schema, match_filters, filters)
+    sql = f"""
+        WITH {ctes}
+        SELECT
+            tr.league_id,
+            COALESCE(ln.league_name, '') AS league_name,
+            tr.team_id,
+            tr.team_name,
+            tr.roster_key,
+            tr.roster_players,
+            tr.match_id,
+            tr.first_seen,
+            tr.last_seen
+        FROM team_rosters tr
+        LEFT JOIN league_names ln
+          ON tr.league_id = ln.league_id
+    """
+    return sql, params
+
+
+def run_fuzzy_detection(
+    connection: Any, args: argparse.Namespace, max_diff: int
+) -> list[dict[str, Any]]:
+    sql, params = build_fuzzy_base_sql(args)
+    if args.print_sql:
+        print("将执行 SQL（模糊阵容基础查询）：")
+        print(sql)
+        print("参数：", params)
+    with connection.cursor() as cursor:
+        cursor.execute(sql, params)
+        base_rows = list(cursor.fetchall())
+    return cluster_fuzzy_rosters(base_rows, args, max_diff)
+
+
+def _to_int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def cluster_fuzzy_rosters(
+    base_rows: list[dict[str, Any]], args: argparse.Namespace, max_diff: int
+) -> list[dict[str, Any]]:
+    """Group rosters by a shared core of K = 5 - max_diff players.
+
+    Two team rosters that share at least K players also share at least one
+    K-sized subset; using each K-subset as a grouping key therefore links all
+    rosters that differ by at most max_diff players. A group is an anomaly when
+    that shared core appears under more than one team_id.
+    """
+    core_size = 5 - int(max_diff)
+    cross = getattr(args, "detection_mode", "same_league") == "cross_league"
+    groups: dict[Any, dict[str, Any]] = {}
+
+    for row in base_rows:
+        players = [p for p in str(row.get("roster_key") or "").split(",") if p]
+        if len(players) != 5:
+            continue
+
+        name_map: dict[str, str] = {}
+        for piece in str(row.get("roster_players") or "").split(";;"):
+            piece = piece.strip()
+            if not piece:
+                continue
+            if " | " in piece:
+                pid, pname = piece.split(" | ", 1)
+                name_map[pid.strip()] = pname.strip()
+            else:
+                name_map.setdefault(piece, "")
+
+        team_id = str(row.get("team_id") or "").strip()
+        team_name = str(row.get("team_name") or "").strip()
+        league_id = str(row.get("league_id") or "").strip()
+        league_name = str(row.get("league_name") or "").strip()
+        match_id = str(row.get("match_id") or "").strip()
+        first_seen = _to_int_or_none(row.get("first_seen"))
+        last_seen = _to_int_or_none(row.get("last_seen"))
+
+        for combo in combinations(sorted(players), core_size):
+            gkey = combo if cross else (league_id, combo)
+            group = groups.get(gkey)
+            if group is None:
+                group = {
+                    "core": list(combo),
+                    "core_names": {p: name_map.get(p, "") for p in combo},
+                    "team_ids": {},
+                    "leagues": {},
+                    "matches": set(),
+                    "occurrences": 0,
+                    "first_seen": None,
+                    "last_seen": None,
+                }
+                groups[gkey] = group
+
+            if team_id:
+                if team_name or team_id not in group["team_ids"]:
+                    group["team_ids"][team_id] = team_name or group["team_ids"].get(team_id, "")
+            if league_id and league_id not in group["leagues"]:
+                group["leagues"][league_id] = league_name
+            if match_id:
+                group["matches"].add(match_id)
+            group["occurrences"] += 1
+            if first_seen is not None:
+                group["first_seen"] = (
+                    first_seen if group["first_seen"] is None else min(group["first_seen"], first_seen)
+                )
+            if last_seen is not None:
+                group["last_seen"] = (
+                    last_seen if group["last_seen"] is None else max(group["last_seen"], last_seen)
+                )
+
+    candidates = []
+    for group in groups.values():
+        if len(group["team_ids"]) <= 1:
+            continue
+        if cross and len(group["leagues"]) <= 1:
+            continue
+        candidates.append(group)
+
+    # Prune groups whose teams and matches are fully contained in a larger one
+    # to avoid emitting many overlapping sub-core rows.
+    candidates.sort(key=lambda g: (len(g["matches"]), len(g["team_ids"])), reverse=True)
+    kept: list[dict[str, Any]] = []
+    for group in candidates:
+        teams = set(group["team_ids"])
+        matches = group["matches"]
+        if any(teams <= set(big["team_ids"]) and matches <= big["matches"] for big in kept):
+            continue
+        kept.append(group)
+
+    rows_out = [_fuzzy_group_to_row(group, cross) for group in kept]
+    if cross:
+        rows_out.sort(key=lambda r: (-int(r["team_id_count"]), -int(r["roster_occurrences"])))
+    else:
+        rows_out.sort(
+            key=lambda r: (str(r["league_id"]), -int(r["team_id_count"]), -int(r["roster_occurrences"]))
+        )
+    if args.limit:
+        rows_out = rows_out[: args.limit]
+    return rows_out
+
+
+def _fuzzy_group_to_row(group: dict[str, Any], cross: bool) -> dict[str, Any]:
+    core = sorted(group["core"])
+    team_ids = sorted(group["team_ids"])
+    leagues = sorted(group["leagues"])
+    matches = sorted(group["matches"])
+    roster_players = ";;".join(f"{p} | {group['core_names'].get(p, '')}" for p in core)
+    team_id_names = ";;".join(f"{t} | {group['team_ids'].get(t, '')}" for t in team_ids)
+    if cross:
+        league_id = ",".join(leagues)
+        league_name = ";;".join(f"{l} | {group['leagues'].get(l, '')}" for l in leagues)
+    else:
+        league_id = leagues[0] if leagues else ""
+        league_name = group["leagues"].get(league_id, "") if leagues else ""
+    return {
+        "league_id": league_id,
+        "league_name": league_name,
+        "roster_key": ",".join(core),
+        "roster_players": roster_players,
+        "league_count": len(leagues),
+        "team_id_count": len(team_ids),
+        "roster_occurrences": group["occurrences"],
+        "team_ids": ",".join(team_ids),
+        "team_id_names": team_id_names,
+        "match_ids": ",".join(matches),
+        "first_seen": group["first_seen"] if group["first_seen"] is not None else "",
+        "last_seen": group["last_seen"] if group["last_seen"] is not None else "",
+    }
+
+
 def run_detection(connection: Any, mapping: FieldMapping, args: argparse.Namespace) -> list[dict[str, Any]]:
+    max_diff = int(getattr(args, "max_diff", 0) or 0)
+    if max_diff > 0:
+        if mapping.table != "players__match_info":
+            raise SystemExit("模糊阵容匹配（--max-diff > 0）目前仅支持 dota2_stats 的 players__match_info 数据源。")
+        return run_fuzzy_detection(connection, args, max_diff)
+
     sql, params = build_detection_sql(mapping, args)
     if args.print_sql:
         print("将执行 SQL：")
@@ -570,7 +774,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--user", default="dota2_reader", help="StarRocks username")
     parser.add_argument("--password", help="StarRocks password; prefer STARROCKS_PASSWORD env var")
     parser.add_argument("--password-env", default="STARROCKS_PASSWORD", help="Password environment variable name")
-    parser.add_argument("--database", default="dota2_analysis", help="Database/schema name. Optional for auto discovery.")
+    parser.add_argument("--database", default="dota2_stats", help="Database/schema name. Optional for auto discovery.")
     parser.add_argument("--table", help="Source table name. Requires manual column arguments.")
     parser.add_argument("--league-col", help="League ID column name")
     parser.add_argument("--team-col", help="Team ID column name")
@@ -585,6 +789,13 @@ def parse_args() -> argparse.Namespace:
         choices=("same_league", "cross_league"),
         default="same_league",
         help="same_league: same roster uses multiple team IDs in one league; cross_league: same roster uses different teams across leagues",
+    )
+    parser.add_argument(
+        "--max-diff",
+        type=int,
+        choices=(0, 1, 2),
+        default=0,
+        help="阵容模糊匹配阈值：允许不同的选手数量。0=5 人完全相同（默认）；1=允许 1 人不同（≥4 人相同）；2=允许 2 人不同（≥3 人相同）。",
     )
     parser.add_argument("--output", default="same_roster_different_team_ids.csv", help="CSV output path")
     parser.add_argument("--limit", type=int, help="Limit report rows")

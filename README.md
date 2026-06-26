@@ -25,7 +25,7 @@ http://127.0.0.1:8000/
 
 ## 主要功能
 
-- 从 `dota2_analysis.players` 和 `dota2_analysis.match_info` 读取完整数据。
+- 从 `dota2_stats.players` 和 `dota2_stats.match_info` 读取完整数据。
 - 支持同一联赛内同 5 人多 Team ID 检测。
 - 支持跨联赛同 5 人不同 Team ID 检测。
 - 支持按比赛结束时间筛选。

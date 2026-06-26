@@ -37,10 +37,13 @@ HTML_FILE = BASE_DIR / "same_roster_visualizer.html"
 DEFAULT_OUTPUT = BASE_DIR / "same_roster_different_team_ids.csv"
 DEFAULT_MANUAL_RECORDS = BASE_DIR / "manual_team_id_records.csv"
 MANUAL_RECORD_FIELDS = [
+    "group_id",
+    "roster",
     "league_id",
     "league_name",
     "team_id",
     "team_name",
+    "note",
 ]
 
 
@@ -52,7 +55,7 @@ def server_args() -> argparse.Namespace:
     parser.add_argument("--starrocks-port", type=int, default=9030, help="StarRocks FE MySQL port")
     parser.add_argument("--user", default="dota2_reader", help="StarRocks username")
     parser.add_argument("--password-env", default="STARROCKS_PASSWORD", help="Password environment variable name")
-    parser.add_argument("--database", default="dota2_analysis", help="Database/schema used for candidate discovery")
+    parser.add_argument("--database", default="dota2_stats", help="Database/schema used for candidate discovery")
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT), help="CSV output path")
     parser.add_argument("--manual-records", default=str(DEFAULT_MANUAL_RECORDS), help="Manual CSV record path")
     parser.add_argument("--connect-timeout", type=int, default=10)
@@ -79,6 +82,7 @@ def detection_args(args: argparse.Namespace, **overrides: Any) -> SimpleNamespac
         "start_time": None,
         "end_time": None,
         "detection_mode": "same_league",
+        "max_diff": 0,
         "output": args.output,
         "limit": None,
         "max_candidates": 20,
@@ -128,10 +132,16 @@ def read_manual_records(path: Path) -> list[dict[str, str]]:
 
 def write_manual_records(path: Path, records: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8-sig") as file:
-        writer = csv.DictWriter(file, fieldnames=MANUAL_RECORD_FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(records)
+    try:
+        with path.open("w", newline="", encoding="utf-8-sig") as file:
+            writer = csv.DictWriter(file, fieldnames=MANUAL_RECORD_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(records)
+    except PermissionError as error:
+        raise PermissionError(
+            f"无法写入 {path.name}：文件可能正在被 Excel / WPS 等程序打开并锁定。"
+            f"请先关闭该 CSV 文件，再回到网页点击保存。（原始错误：{error}）"
+        ) from error
 
 
 class RosterHandler(SimpleHTTPRequestHandler):
@@ -202,6 +212,14 @@ class RosterHandler(SimpleHTTPRequestHandler):
             self.send_json({"error": "limit 必须是数字。"}, HTTPStatus.BAD_REQUEST)
             return
 
+        try:
+            max_diff = int(body.get("max_diff") or 0)
+        except (TypeError, ValueError):
+            max_diff = 0
+        if max_diff not in (0, 1, 2):
+            self.send_json({"error": "max_diff 只能是 0、1 或 2。"}, HTTPStatus.BAD_REQUEST)
+            return
+
         mapping = mapping_from_candidate(candidate_payload)
         args = detection_args(
             self.app_args,
@@ -210,6 +228,7 @@ class RosterHandler(SimpleHTTPRequestHandler):
             start_time=str(body.get("start_time")).strip() if body.get("start_time") else None,
             end_time=str(body.get("end_time")).strip() if body.get("end_time") else None,
             detection_mode=str(body.get("detection_mode") or "same_league"),
+            max_diff=max_diff,
             limit=limit_value,
         )
 
