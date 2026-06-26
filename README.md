@@ -39,6 +39,7 @@ http://127.0.0.1:8000/
 - 按比赛结束时间范围筛选。
 - **维护表**：可编辑 CSV，字段为 `group_id, roster, league_id, league_name, team_id, team_name, note`，同一支真实队伍的多个 Team ID 共享组号并按组高亮展示，便于看出关联关系。
 - **选手追踪**：输入 steamid（纯数字）直接追踪；输入名字会先列出候选选手再选择。结果含「代表过的队伍」与「参加过的联赛」两张表。
+- **战队队徽**：通过 Dota2 官方接口按 team_id 拉取队徽（`url_logo`），在选手追踪与维护表中展示，并把 `team_logo` 一并存入维护表 CSV。
 
 ## 命令行用法（可选，不经网页）
 
@@ -54,6 +55,7 @@ python .\detect_same_roster_team_ids.py --detection-mode cross_league --max-diff
 - `GET  /api/manual-records` / `POST /api/manual-records/save-all` / `POST /api/manual-records/delete`：维护表读写。
 - `GET  /api/player-candidates?q=名字`：按名字搜索选手。
 - `POST /api/player-track`：按 steamid 追踪队伍 / 联赛历史。
+- `GET  /api/team-logo?team_id=X` / `GET /api/team-logos?ids=a,b,c`：代理 Dota2 官方接口获取战队队徽（带内存缓存）。
 
 ## 注意事项
 

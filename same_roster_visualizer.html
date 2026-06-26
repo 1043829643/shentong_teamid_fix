@@ -498,6 +498,18 @@
     .group-roster { font-weight: 700; color: var(--text); margin-right: 12px; }
     .group-count { color: var(--muted); font-size: 12.5px; }
 
+    .team-logo-img {
+      width: 26px;
+      height: 26px;
+      object-fit: contain;
+      border-radius: 6px;
+      background: #f1f5f9;
+      vertical-align: middle;
+    }
+    .logo-cell { text-align: center; }
+    .team-cell { display: inline-flex; align-items: center; gap: 8px; }
+    .team-logo { display: inline-flex; width: 26px; height: 26px; flex: 0 0 auto; }
+
     /* ---------- Pagination ---------- */
     .pagination {
       display: flex;
@@ -772,6 +784,7 @@
           </div>
           <div class="actions-row">
             <button id="addManualRow" type="button">新增空行</button>
+            <button id="fetchAllLogos" class="secondary" type="button">拉取全部队徽</button>
             <button id="saveManualTable" type="button">保存整张 CSV</button>
             <button id="reloadManualTable" class="secondary" type="button">重新读取 CSV</button>
             <a href="/api/manual-records" target="_blank"><button class="ghost" type="button">查看原始 JSON</button></a>
@@ -787,12 +800,13 @@
                 <th>联赛名</th>
                 <th>队伍 ID</th>
                 <th>队伍名</th>
+                <th>队徽</th>
                 <th>备注</th>
                 <th>操作</th>
               </tr>
             </thead>
             <tbody id="manualRecordBody">
-              <tr><td colspan="8" class="empty">暂无手工记录</td></tr>
+              <tr><td colspan="9" class="empty">暂无手工记录</td></tr>
             </tbody>
           </table>
         </div>
@@ -950,7 +964,35 @@
     const playerTeamBody = document.querySelector("#playerTeamBody");
     const playerLeagueBody = document.querySelector("#playerLeagueBody");
 
-    const manualFields = ["group_id", "roster", "league_id", "league_name", "team_id", "team_name", "note"];
+    const manualFields = ["group_id", "roster", "league_id", "league_name", "team_id", "team_name", "team_logo", "note"];
+    const teamLogoCache = new Map();
+
+    async function fetchTeamLogos(ids) {
+      const missing = [...new Set(ids.filter((id) => id && /^\d+$/.test(id) && id !== "0" && !teamLogoCache.has(id)))];
+      if (missing.length) {
+        try {
+          const resp = await fetch(`/api/team-logos?ids=${missing.join(",")}`);
+          const data = await readApiResponse(resp);
+          Object.entries(data.logos || {}).forEach(([id, info]) => teamLogoCache.set(id, info));
+        } catch { /* 忽略网络错误，保留无 logo 状态 */ }
+      }
+      const map = {};
+      ids.forEach((id) => { if (teamLogoCache.has(id)) map[id] = teamLogoCache.get(id); });
+      return map;
+    }
+
+    async function hydrateTeamLogos(root) {
+      const spans = [...root.querySelectorAll(".team-logo[data-team-id]:not([data-done])")];
+      if (!spans.length) return;
+      const map = await fetchTeamLogos(spans.map((s) => s.dataset.teamId));
+      spans.forEach((span) => {
+        span.setAttribute("data-done", "1");
+        const info = map[span.dataset.teamId];
+        if (info && info.logo_url) {
+          span.innerHTML = `<img class="team-logo-img" src="${escapeHtml(info.logo_url)}" alt="" title="${escapeHtml(info.name || "")}">`;
+        }
+      });
+    }
 
     let rows = [];
     let filteredRows = [];
@@ -980,6 +1022,7 @@
     searchInput.addEventListener("input", () => { currentPage = 1; render(); });
     downloadButton.addEventListener("click", downloadFilteredCsv);
     addManualRowButton.addEventListener("click", addBlankManualRow);
+    document.querySelector("#fetchAllLogos").addEventListener("click", fetchAllManualLogos);
     saveManualTableButton.addEventListener("click", saveManualTable);
     reloadManualTableButton.addEventListener("click", loadManualRecords);
     rosterExplorer.addEventListener("click", handleRosterExplorerClick);
@@ -1198,7 +1241,7 @@
         .join("、");
     }
 
-    function addManualRecordFromAnomaly(row) {
+    async function addManualRecordFromAnomaly(row) {
       const teams = splitList(row.team_id_names || row.team_ids);
       const group = nextGroupId();
       const roster = rosterText(row);
@@ -1211,13 +1254,19 @@
           league_name: firstLeagueName(row),
           team_id: teamId || "",
           team_name: teamName || "",
+          team_logo: "",
           note: "",
         };
       });
       manualRecords.push(...newRecords);
       renderManualRecords();
-      manualStatus.textContent = `已添加“组 ${group}”（${newRecords.length} 支关联队伍），去“维护表”页编辑后点击“保存整张 CSV”。`;
+      manualStatus.textContent = `已添加“组 ${group}”（${newRecords.length} 支关联队伍），正在拉取队徽...`;
       toast(`已加入组 ${group}：${newRecords.length} 支关联队伍`, "ok");
+
+      const logos = await fetchTeamLogos(newRecords.map((r) => r.team_id));
+      newRecords.forEach((r) => { r.team_logo = logos[r.team_id]?.logo_url || ""; });
+      renderManualRecords();
+      manualStatus.textContent = `已添加“组 ${group}”并拉取队徽，编辑后点击“保存整张 CSV”。`;
     }
 
     function addBlankManualRow() {
@@ -1228,10 +1277,26 @@
         league_name: "",
         team_id: "",
         team_name: "",
+        team_logo: "",
         note: "",
       });
       renderManualRecords();
       manualStatus.textContent = "已新增空行，编辑后请点击“保存整张 CSV”。";
+    }
+
+    async function fetchAllManualLogos() {
+      manualRecords = collectManualRecordsFromTable();
+      const ids = manualRecords.map((r) => r.team_id).filter(Boolean);
+      if (!ids.length) { manualStatus.textContent = "没有可拉取队徽的队伍 ID。"; return; }
+      manualStatus.textContent = "正在拉取全部队徽...";
+      const logos = await fetchTeamLogos(ids);
+      manualRecords.forEach((r) => {
+        const url = logos[r.team_id]?.logo_url;
+        if (url) r.team_logo = url;
+      });
+      renderManualRecords();
+      manualStatus.textContent = "已拉取队徽，记得点击“保存整张 CSV”写入文件。";
+      toast("队徽已拉取", "ok");
     }
 
     async function saveManualTable() {
@@ -1253,7 +1318,18 @@
       }
     }
 
-    function handleManualRecordClick(event) {
+    async function handleManualRecordClick(event) {
+      const fetchButton = event.target.closest(".fetch-logo");
+      if (fetchButton) {
+        const teamId = fetchButton.dataset.teamId;
+        manualRecords = collectManualRecordsFromTable();
+        const logos = await fetchTeamLogos([teamId]);
+        const url = logos[teamId]?.logo_url || "";
+        manualRecords.forEach((r) => { if (r.team_id === teamId) r.team_logo = url; });
+        renderManualRecords();
+        manualStatus.textContent = url ? "已拉取队徽，记得保存。" : "未找到该队伍的队徽。";
+        return;
+      }
       const button = event.target.closest(".delete-manual-record");
       if (!button) return;
       if (!confirm("确认删除这条手工记录吗？")) return;
@@ -1265,7 +1341,7 @@
 
     function renderManualRecords() {
       if (manualRecords.length === 0) {
-        manualRecordBody.innerHTML = '<tr><td colspan="8" class="empty">暂无手工记录</td></tr>';
+        manualRecordBody.innerHTML = '<tr><td colspan="9" class="empty">暂无手工记录</td></tr>';
         return;
       }
 
@@ -1286,7 +1362,7 @@
           const roster = members.find((r) => r.roster)?.roster || "（未填选手）";
           html.push(`
             <tr class="manual-group-head">
-              <td colspan="8">
+              <td colspan="9">
                 <span class="group-badge">组 ${escapeHtml(group || "-")}</span>
                 <span class="group-roster">共用选手：${escapeHtml(roster)}</span>
                 <span class="group-count">关联 ${members.length} 支队伍</span>
@@ -1294,13 +1370,27 @@
             </tr>`);
           lastGroup = group;
         }
+        const cells = manualFields.map((field) => {
+          if (field === "team_logo") return renderLogoCell(record);
+          const editableClass = field === "roster" || field === "note" ? "" : "mono";
+          return `<td class="${editableClass}" contenteditable="true" data-field="${field}">${escapeHtml(record[field] || "")}</td>`;
+        }).join("");
         html.push(`
           <tr class="manual-record-row" data-index="${index}">
-            ${manualFields.map((field) => `<td class="${field === "roster" || field === "note" ? "" : "mono"}" contenteditable="true" data-field="${field}">${escapeHtml(record[field] || "")}</td>`).join("")}
+            ${cells}
             <td><button class="ghost small delete-manual-record" type="button" data-index="${index}">删除</button></td>
           </tr>`);
       });
       manualRecordBody.innerHTML = html.join("");
+    }
+
+    function renderLogoCell(record) {
+      const url = record.team_logo || "";
+      const teamId = record.team_id || "";
+      const inner = url
+        ? `<img class="team-logo-img" src="${escapeHtml(url)}" alt="">`
+        : `<button class="ghost small fetch-logo" type="button" data-team-id="${escapeHtml(teamId)}">拉取</button>`;
+      return `<td class="logo-cell" data-field="team_logo" data-value="${escapeHtml(url)}">${inner}</td>`;
     }
 
     function collectManualRecordsFromTable() {
@@ -1308,7 +1398,10 @@
         const record = {};
         manualFields.forEach((field) => {
           const cell = row.querySelector(`[data-field="${field}"]`);
-          record[field] = (cell?.innerText || "").trim();
+          if (!cell) { record[field] = ""; return; }
+          record[field] = field === "team_logo"
+            ? (cell.dataset.value || "").trim()
+            : (cell.innerText || "").trim();
         });
         return record;
       });
@@ -1614,7 +1707,7 @@
               .map((l) => `<span class="tag">${escapeHtml(displayLeague(l))} · ${l.match_count}</span>`).join("");
             return `
               <tr>
-                <td class="mono">${escapeHtml(team.team_id)}${team.team_name ? " | " + escapeHtml(team.team_name) : ""}</td>
+                <td><span class="team-cell"><span class="team-logo" data-team-id="${escapeHtml(team.team_id)}"></span><span class="mono">${escapeHtml(team.team_id)}${team.team_name ? " | " + escapeHtml(team.team_name) : ""}</span></span></td>
                 <td><strong>${escapeHtml(team.match_count)}</strong></td>
                 <td>${leagueTags || '<span class="hint">-</span>'}</td>
                 <td class="mono">${escapeHtml(formatTime(team.first_seen))}</td>
@@ -1639,6 +1732,7 @@
           }).join("");
 
       playerResult.style.display = "block";
+      hydrateTeamLogos(playerTeamBody);
     }
 
     // ---------- helpers ----------

@@ -13,6 +13,7 @@ import csv
 import json
 import mimetypes
 import os
+import urllib.request
 from dataclasses import asdict
 from datetime import date, datetime
 from decimal import Decimal
@@ -45,8 +46,37 @@ MANUAL_RECORD_FIELDS = [
     "league_name",
     "team_id",
     "team_name",
+    "team_logo",
     "note",
 ]
+
+TEAM_INFO_URL = "https://www.dota2.com/webapi/IDOTA2Teams/GetSingleTeamInfo/v001?team_id={team_id}"
+_TEAM_INFO_CACHE: dict[str, dict[str, str]] = {}
+
+
+def fetch_team_info(team_id: str) -> dict[str, str]:
+    """Fetch team name/tag/logo from the Dota2 web API, cached in memory."""
+    team_id = str(team_id).strip()
+    info = {"team_id": team_id, "name": "", "tag": "", "logo_url": ""}
+    if not team_id or not team_id.isdigit() or team_id == "0":
+        return info
+    if team_id in _TEAM_INFO_CACHE:
+        return _TEAM_INFO_CACHE[team_id]
+    try:
+        request = urllib.request.Request(
+            TEAM_INFO_URL.format(team_id=team_id),
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        info["name"] = str(data.get("name") or "")
+        info["tag"] = str(data.get("tag") or "")
+        info["logo_url"] = str(data.get("url_logo") or "")
+    except Exception:
+        # Network/parse errors return an empty logo rather than failing the page.
+        pass
+    _TEAM_INFO_CACHE[team_id] = info
+    return info
 
 
 def server_args() -> argparse.Namespace:
@@ -172,6 +202,15 @@ class RosterHandler(SimpleHTTPRequestHandler):
             if parsed.path == "/api/player-candidates":
                 query = parse_qs(parsed.query)
                 self.handle_player_candidates((query.get("q", [""])[0] or "").strip())
+                return
+            if parsed.path == "/api/team-logo":
+                query = parse_qs(parsed.query)
+                self.send_json(fetch_team_info((query.get("team_id", [""])[0] or "").strip()))
+                return
+            if parsed.path == "/api/team-logos":
+                query = parse_qs(parsed.query)
+                ids = [i.strip() for i in (query.get("ids", [""])[0] or "").split(",") if i.strip()]
+                self.send_json({"logos": {tid: fetch_team_info(tid) for tid in ids}})
                 return
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
         except Exception as error:
