@@ -701,6 +701,232 @@ def _fuzzy_group_to_row(group: dict[str, Any], cross: bool) -> dict[str, Any]:
     }
 
 
+def build_player_candidates_sql(args: argparse.Namespace, query: str) -> tuple[str, list[Any]]:
+    database = getattr(args, "database", None) or "dota2_stats"
+    schema = quote_ident(database)
+    sql = f"""
+        SELECT CAST(steamid AS VARCHAR) AS steamid, MAX(name) AS name
+        FROM {schema}.`pro_players`
+        WHERE steamid IS NOT NULL AND name LIKE %s
+        GROUP BY CAST(steamid AS VARCHAR)
+        ORDER BY MAX(name)
+        LIMIT 50
+    """
+    return sql, [f"%{query}%"]
+
+
+def build_player_name_sql(args: argparse.Namespace, steamid: str) -> tuple[str, list[Any]]:
+    database = getattr(args, "database", None) or "dota2_stats"
+    schema = quote_ident(database)
+    sql = f"""
+        SELECT MAX(name) AS name
+        FROM {schema}.`pro_players`
+        WHERE CAST(steamid AS VARCHAR) = %s
+    """
+    return sql, [str(steamid)]
+
+
+def build_player_track_sql(args: argparse.Namespace, steamid: str) -> tuple[str, list[Any]]:
+    """Per (team_id, league_id) match counts for a single player's steamid."""
+    database = getattr(args, "database", None) or "dota2_stats"
+    schema = quote_ident(database)
+    match_filters = [
+        "match_id IS NOT NULL",
+        "CAST(match_id AS VARCHAR) <> '0'",
+        "league_id IS NOT NULL",
+    ]
+    params: list[Any] = []
+    start_time = parse_time_filter(getattr(args, "start_time", None))
+    end_time = parse_time_filter(getattr(args, "end_time", None), end_of_day=True)
+    if start_time is not None:
+        match_filters.append("end_time >= %s")
+        params.append(start_time)
+    if end_time is not None:
+        match_filters.append("end_time <= %s")
+        params.append(end_time)
+    params.append(str(steamid))
+
+    sql = f"""
+        WITH league_names AS (
+            SELECT CAST(league_id AS VARCHAR) AS league_id, MAX(league_name) AS league_name
+            FROM (
+                SELECT league_id, league_name FROM {schema}.`pro_match_list`
+                UNION ALL
+                SELECT league_id, league_name FROM {schema}.`pro_match_list_2`
+                UNION ALL
+                SELECT league_id, league_name FROM {schema}.`match_info_upload`
+            ) names
+            WHERE league_id IS NOT NULL
+              AND league_name IS NOT NULL
+              AND league_name <> ''
+            GROUP BY CAST(league_id AS VARCHAR)
+        ),
+        match_info_dedup AS (
+            SELECT
+                CAST(match_id AS VARCHAR) AS match_id,
+                CAST(MAX(league_id) AS VARCHAR) AS league_id,
+                CAST(MAX(radiant_team_id) AS VARCHAR) AS radiant_team_id,
+                CAST(MAX(dire_team_id) AS VARCHAR) AS dire_team_id,
+                MAX(radiant_team_tag) AS radiant_team_name,
+                MAX(dire_team_tag) AS dire_team_name,
+                MIN(end_time) AS match_time
+            FROM {schema}.`match_info`
+            WHERE {" AND ".join(match_filters)}
+            GROUP BY CAST(match_id AS VARCHAR)
+        ),
+        player_rows AS (
+            SELECT
+                mi.league_id,
+                mi.match_id,
+                CASE
+                    WHEN p.team = 2 THEN mi.radiant_team_id
+                    WHEN p.team = 3 THEN mi.dire_team_id
+                    WHEN p.slot BETWEEN 0 AND 4 THEN mi.radiant_team_id
+                    WHEN p.slot BETWEEN 5 AND 9 THEN mi.dire_team_id
+                END AS team_id,
+                CASE
+                    WHEN p.team = 2 THEN mi.radiant_team_name
+                    WHEN p.team = 3 THEN mi.dire_team_name
+                    WHEN p.slot BETWEEN 0 AND 4 THEN mi.radiant_team_name
+                    WHEN p.slot BETWEEN 5 AND 9 THEN mi.dire_team_name
+                END AS team_name,
+                mi.match_time
+            FROM {schema}.`players` p
+            JOIN match_info_dedup mi
+              ON CAST(p.match_id AS VARCHAR) = mi.match_id
+            WHERE CAST(p.steamid AS VARCHAR) = %s
+              AND CAST(p.match_id AS VARCHAR) <> '0'
+        )
+        SELECT
+            CAST(pr.team_id AS VARCHAR) AS team_id,
+            MAX(pr.team_name) AS team_name,
+            pr.league_id AS league_id,
+            MAX(ln.league_name) AS league_name,
+            COUNT(DISTINCT pr.match_id) AS match_count,
+            MIN(pr.match_time) AS first_seen,
+            MAX(pr.match_time) AS last_seen
+        FROM player_rows pr
+        LEFT JOIN league_names ln ON pr.league_id = ln.league_id
+        WHERE pr.team_id IS NOT NULL AND CAST(pr.team_id AS VARCHAR) <> '0'
+        GROUP BY CAST(pr.team_id AS VARCHAR), pr.league_id
+        ORDER BY match_count DESC
+    """
+    return sql, params
+
+
+def search_player_candidates(
+    connection: Any, args: argparse.Namespace, query: str
+) -> list[dict[str, Any]]:
+    sql, params = build_player_candidates_sql(args, query)
+    with connection.cursor() as cursor:
+        cursor.execute(sql, params)
+        return [
+            {"steamid": str(row.get("steamid") or ""), "name": str(row.get("name") or "")}
+            for row in cursor.fetchall()
+        ]
+
+
+def run_player_track(
+    connection: Any, args: argparse.Namespace, steamid: str
+) -> dict[str, Any]:
+    with connection.cursor() as cursor:
+        name_sql, name_params = build_player_name_sql(args, steamid)
+        cursor.execute(name_sql, name_params)
+        name_row = cursor.fetchone()
+        player_name = str((name_row or {}).get("name") or "") if name_row else ""
+
+        sql, params = build_player_track_sql(args, steamid)
+        cursor.execute(sql, params)
+        rows = list(cursor.fetchall())
+
+    teams: dict[str, dict[str, Any]] = {}
+    leagues: dict[str, dict[str, Any]] = {}
+    total_matches = 0
+
+    for row in rows:
+        team_id = str(row.get("team_id") or "")
+        team_name = str(row.get("team_name") or "")
+        league_id = str(row.get("league_id") or "")
+        league_name = str(row.get("league_name") or "")
+        match_count = int(row.get("match_count") or 0)
+        first_seen = _to_int_or_none(row.get("first_seen"))
+        last_seen = _to_int_or_none(row.get("last_seen"))
+        total_matches += match_count
+
+        team = teams.setdefault(
+            team_id,
+            {
+                "team_id": team_id,
+                "team_name": team_name,
+                "match_count": 0,
+                "leagues": [],
+                "first_seen": None,
+                "last_seen": None,
+            },
+        )
+        if team_name and not team["team_name"]:
+            team["team_name"] = team_name
+        team["match_count"] += match_count
+        team["leagues"].append(
+            {"league_id": league_id, "league_name": league_name, "match_count": match_count}
+        )
+        team["first_seen"] = _merge_min(team["first_seen"], first_seen)
+        team["last_seen"] = _merge_max(team["last_seen"], last_seen)
+
+        league = leagues.setdefault(
+            league_id,
+            {
+                "league_id": league_id,
+                "league_name": league_name,
+                "match_count": 0,
+                "teams": [],
+                "first_seen": None,
+                "last_seen": None,
+            },
+        )
+        if league_name and not league["league_name"]:
+            league["league_name"] = league_name
+        league["match_count"] += match_count
+        league["teams"].append(
+            {"team_id": team_id, "team_name": team_name, "match_count": match_count}
+        )
+        league["first_seen"] = _merge_min(league["first_seen"], first_seen)
+        league["last_seen"] = _merge_max(league["last_seen"], last_seen)
+
+    team_list = sorted(teams.values(), key=lambda t: -t["match_count"])
+    league_list = sorted(leagues.values(), key=lambda l: -l["match_count"])
+    for team in team_list:
+        team["leagues"].sort(key=lambda x: -x["match_count"])
+        team["first_seen"] = team["first_seen"] if team["first_seen"] is not None else ""
+        team["last_seen"] = team["last_seen"] if team["last_seen"] is not None else ""
+    for league in league_list:
+        league["teams"].sort(key=lambda x: -x["match_count"])
+        league["first_seen"] = league["first_seen"] if league["first_seen"] is not None else ""
+        league["last_seen"] = league["last_seen"] if league["last_seen"] is not None else ""
+
+    return {
+        "steamid": str(steamid),
+        "player_name": player_name,
+        "total_matches": total_matches,
+        "team_count": len(team_list),
+        "league_count": len(league_list),
+        "teams": team_list,
+        "leagues": league_list,
+    }
+
+
+def _merge_min(current: int | None, value: int | None) -> int | None:
+    if value is None:
+        return current
+    return value if current is None else min(current, value)
+
+
+def _merge_max(current: int | None, value: int | None) -> int | None:
+    if value is None:
+        return current
+    return value if current is None else max(current, value)
+
+
 def run_detection(connection: Any, mapping: FieldMapping, args: argparse.Namespace) -> list[dict[str, Any]]:
     max_diff = int(getattr(args, "max_diff", 0) or 0)
     if max_diff > 0:

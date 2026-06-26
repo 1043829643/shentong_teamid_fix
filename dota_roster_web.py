@@ -28,6 +28,8 @@ from detect_same_roster_team_ids import (
     connect,
     discover_candidates,
     run_detection,
+    run_player_track,
+    search_player_candidates,
     write_csv,
 )
 
@@ -167,6 +169,10 @@ class RosterHandler(SimpleHTTPRequestHandler):
             if parsed.path == "/api/manual-records":
                 self.handle_manual_records()
                 return
+            if parsed.path == "/api/player-candidates":
+                query = parse_qs(parsed.query)
+                self.handle_player_candidates((query.get("q", [""])[0] or "").strip())
+                return
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
         except Exception as error:
             self.send_json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -185,6 +191,9 @@ class RosterHandler(SimpleHTTPRequestHandler):
                 return
             if parsed.path == "/api/manual-records/delete":
                 self.handle_delete_manual_record()
+                return
+            if parsed.path == "/api/player-track":
+                self.handle_player_track()
                 return
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
         except Exception as error:
@@ -243,6 +252,34 @@ class RosterHandler(SimpleHTTPRequestHandler):
                     "mapping": asdict(mapping),
                 }
             )
+        finally:
+            connection.close()
+
+    def handle_player_candidates(self, query: str) -> None:
+        if not query:
+            self.send_json({"candidates": []})
+            return
+        args = detection_args(self.app_args)
+        connection = connect(args)
+        try:
+            self.send_json({"candidates": search_player_candidates(connection, args, query)})
+        finally:
+            connection.close()
+
+    def handle_player_track(self) -> None:
+        body = self.read_json_body()
+        steamid = str(body.get("steamid") or "").strip()
+        if not steamid.isdigit():
+            self.send_json({"error": "请输入有效的 steamid（纯数字）。"}, HTTPStatus.BAD_REQUEST)
+            return
+        args = detection_args(
+            self.app_args,
+            start_time=str(body.get("start_time")).strip() if body.get("start_time") else None,
+            end_time=str(body.get("end_time")).strip() if body.get("end_time") else None,
+        )
+        connection = connect(args)
+        try:
+            self.send_json(jsonable(run_player_track(connection, args, steamid)))
         finally:
             connection.close()
 

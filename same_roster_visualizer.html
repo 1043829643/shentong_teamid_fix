@@ -572,6 +572,7 @@
       <button data-tab="query" class="active"><span class="num">1</span>查询数据</button>
       <button data-tab="analysis"><span class="num">2</span>结果分析</button>
       <button data-tab="manual"><span class="num">3</span>维护表</button>
+      <button data-tab="player"><span class="num">4</span>选手追踪</button>
     </nav>
   </header>
 
@@ -797,6 +798,105 @@
         </div>
       </div>
     </section>
+
+    <!-- ================= Tab 4: Player tracking ================= -->
+    <section class="tab-page" id="tab-player">
+      <div class="panel">
+        <div class="section-title">
+          <h2><span class="pill">D</span>选手队伍追踪</h2>
+          <span class="hint">输入 steamid 或选手名，查看他代表过哪些队伍、打过哪些联赛</span>
+        </div>
+        <div class="body-pad">
+          <div class="field-grid">
+            <div style="grid-column: span 2;">
+              <label for="playerQuery">选手 steamid 或 名字</label>
+              <input id="playerQuery" type="text" placeholder="例如 76561198041572126 或 KingJungles">
+            </div>
+            <div>
+              <label for="playerStartTime">开始时间</label>
+              <input id="playerStartTime" type="datetime-local">
+            </div>
+            <div>
+              <label for="playerEndTime">结束时间</label>
+              <input id="playerEndTime" type="datetime-local">
+            </div>
+          </div>
+          <div class="actions-row">
+            <button id="playerSearch" type="button">搜索</button>
+          </div>
+          <div id="playerStatus" class="status-line">输入纯数字 steamid 直接追踪；输入名字会先列出候选选手供你选择。</div>
+          <div id="playerCandidates" class="roster-list" style="padding:0;margin-top:14px;"></div>
+        </div>
+      </div>
+
+      <div id="playerResult" style="display:none;">
+        <div class="stats">
+          <div class="card accent">
+            <div class="label">选手</div>
+            <div id="playerName" class="value" style="font-size:22px;">-</div>
+            <div id="playerSteamid" class="mono" style="margin-top:6px;color:rgb(255 255 255 / 80%);font-size:12px;"></div>
+          </div>
+          <div class="card">
+            <div class="label">总比赛数</div>
+            <div id="playerMatches" class="value">0</div>
+          </div>
+          <div class="card">
+            <div class="label">代表过的队伍</div>
+            <div id="playerTeams" class="value">0</div>
+          </div>
+          <div class="card">
+            <div class="label">参加过的联赛</div>
+            <div id="playerLeagues" class="value">0</div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="section-title">
+            <h2>代表过的队伍（含 team_id 变化）</h2>
+            <span class="hint">按比赛数排序</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>队伍 ID / 名称</th>
+                  <th>比赛数</th>
+                  <th>涉及联赛</th>
+                  <th>首次</th>
+                  <th>末次</th>
+                </tr>
+              </thead>
+              <tbody id="playerTeamBody">
+                <tr><td colspan="5" class="empty">暂无数据</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="section-title">
+            <h2>参加过的联赛</h2>
+            <span class="hint">按比赛数排序</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>联赛 ID / 名称</th>
+                  <th>比赛数</th>
+                  <th>使用过的队伍</th>
+                  <th>首次</th>
+                  <th>末次</th>
+                </tr>
+              </thead>
+              <tbody id="playerLeagueBody">
+                <tr><td colspan="5" class="empty">暂无数据</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
   </main>
 
   <div id="toast"></div>
@@ -840,6 +940,15 @@
     const prevPageButton = document.querySelector("#prevPage");
     const nextPageButton = document.querySelector("#nextPage");
     const toastBox = document.querySelector("#toast");
+    const playerQuery = document.querySelector("#playerQuery");
+    const playerStartTime = document.querySelector("#playerStartTime");
+    const playerEndTime = document.querySelector("#playerEndTime");
+    const playerSearchButton = document.querySelector("#playerSearch");
+    const playerStatus = document.querySelector("#playerStatus");
+    const playerCandidates = document.querySelector("#playerCandidates");
+    const playerResult = document.querySelector("#playerResult");
+    const playerTeamBody = document.querySelector("#playerTeamBody");
+    const playerLeagueBody = document.querySelector("#playerLeagueBody");
 
     const manualFields = ["group_id", "roster", "league_id", "league_name", "team_id", "team_name", "note"];
 
@@ -903,6 +1012,13 @@
     });
     prevPageButton.addEventListener("click", () => { if (currentPage > 1) { currentPage -= 1; render(); } });
     nextPageButton.addEventListener("click", () => { currentPage += 1; render(); });
+
+    playerSearchButton.addEventListener("click", searchPlayer);
+    playerQuery.addEventListener("keydown", (event) => { if (event.key === "Enter") searchPlayer(); });
+    playerCandidates.addEventListener("click", (event) => {
+      const btn = event.target.closest("button[data-steamid]");
+      if (btn) trackPlayer(btn.dataset.steamid);
+    });
 
     loadManualRecords();
 
@@ -1425,6 +1541,104 @@
           th.appendChild(span);
         }
       });
+    }
+
+    // ---------- player tracking ----------
+    async function searchPlayer() {
+      const query = playerQuery.value.trim();
+      if (!query) { playerStatus.textContent = "请输入 steamid 或选手名。"; return; }
+      playerCandidates.innerHTML = "";
+      if (/^\d+$/.test(query)) {
+        await trackPlayer(query);
+        return;
+      }
+      playerStatus.textContent = "正在按名字搜索候选选手...";
+      try {
+        const response = await fetch(`/api/player-candidates?q=${encodeURIComponent(query)}`);
+        const data = await readApiResponse(response);
+        const candidates = data.candidates || [];
+        if (candidates.length === 0) {
+          playerStatus.textContent = "没有匹配的选手，可改用 steamid 直接搜索。";
+          return;
+        }
+        playerStatus.textContent = `找到 ${candidates.length} 个候选选手，点击选择：`;
+        playerCandidates.innerHTML = candidates.map((c) => `
+          <button class="secondary" type="button" data-steamid="${escapeHtml(c.steamid)}" style="text-align:left;">
+            ${escapeHtml(c.name || "（无名）")} <span class="mono" style="opacity:.7;">· ${escapeHtml(c.steamid)}</span>
+          </button>`).join("");
+      } catch (error) {
+        playerStatus.textContent = "搜索失败。";
+        showError(error.message || String(error));
+      }
+    }
+
+    async function trackPlayer(steamid) {
+      playerCandidates.innerHTML = "";
+      playerStatus.textContent = `正在追踪 steamid ${steamid} 的队伍与联赛...`;
+      playerSearchButton.disabled = true;
+      try {
+        const response = await fetch("/api/player-track", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            steamid,
+            start_time: formatDatetimeLocal(playerStartTime.value),
+            end_time: formatDatetimeLocal(playerEndTime.value),
+          }),
+        });
+        const data = await readApiResponse(response);
+        renderPlayerResult(data);
+        hideError();
+        playerStatus.textContent = `已追踪 ${data.player_name || steamid}：${data.team_count} 支队伍、${data.league_count} 个联赛。`;
+      } catch (error) {
+        playerResult.style.display = "none";
+        playerStatus.textContent = "追踪失败。";
+        showError(error.message || String(error));
+      } finally {
+        playerSearchButton.disabled = false;
+      }
+    }
+
+    function renderPlayerResult(data) {
+      document.querySelector("#playerName").textContent = data.player_name || "（未知选手名）";
+      document.querySelector("#playerSteamid").textContent = `steamid: ${data.steamid}`;
+      document.querySelector("#playerMatches").textContent = data.total_matches || 0;
+      document.querySelector("#playerTeams").textContent = data.team_count || 0;
+      document.querySelector("#playerLeagues").textContent = data.league_count || 0;
+
+      const teams = data.teams || [];
+      playerTeamBody.innerHTML = teams.length === 0
+        ? '<tr><td colspan="5" class="empty">该时间范围内没有职业队伍记录</td></tr>'
+        : teams.map((team) => {
+            const leagueTags = (team.leagues || [])
+              .map((l) => `<span class="tag">${escapeHtml(displayLeague(l))} · ${l.match_count}</span>`).join("");
+            return `
+              <tr>
+                <td class="mono">${escapeHtml(team.team_id)}${team.team_name ? " | " + escapeHtml(team.team_name) : ""}</td>
+                <td><strong>${escapeHtml(team.match_count)}</strong></td>
+                <td>${leagueTags || '<span class="hint">-</span>'}</td>
+                <td class="mono">${escapeHtml(formatTime(team.first_seen))}</td>
+                <td class="mono">${escapeHtml(formatTime(team.last_seen))}</td>
+              </tr>`;
+          }).join("");
+
+      const leagues = data.leagues || [];
+      playerLeagueBody.innerHTML = leagues.length === 0
+        ? '<tr><td colspan="5" class="empty">该时间范围内没有联赛记录</td></tr>'
+        : leagues.map((league) => {
+            const teamTags = (league.teams || [])
+              .map((t) => `<span class="tag danger">${escapeHtml(t.team_id)}${t.team_name ? " | " + escapeHtml(t.team_name) : ""} · ${t.match_count}</span>`).join("");
+            return `
+              <tr>
+                <td class="mono">${escapeHtml(displayLeague(league))}</td>
+                <td><strong>${escapeHtml(league.match_count)}</strong></td>
+                <td>${teamTags || '<span class="hint">-</span>'}</td>
+                <td class="mono">${escapeHtml(formatTime(league.first_seen))}</td>
+                <td class="mono">${escapeHtml(formatTime(league.last_seen))}</td>
+              </tr>`;
+          }).join("");
+
+      playerResult.style.display = "block";
     }
 
     // ---------- helpers ----------
